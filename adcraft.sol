@@ -1,27 +1,23 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.23;
 
-import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import "@openzeppelin/contracts/access/AccessControlEnumerable.sol";
-import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@4.9.3/token/ERC721/extensions/ERC721URIStorage.sol";
+import "@openzeppelin/contracts@4.9.3/access/AccessControlEnumerable.sol";
+import "@openzeppelin/contracts@4.9.3/security/Pausable.sol";
+import "@openzeppelin/contracts@4.9.3/token/ERC20/IERC20.sol";
 
-contract AdCraftPlatform is ERC721, AccessControlEnumerable, ChainlinkClient {
+contract AdCraftPlatform is
+    ERC721URIStorage,
+    AccessControlEnumerable,
+    Pausable
+{
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-
-    using Chainlink for Chainlink.Request;
-    
-    // Oracle parameters
-    address private oracle;
-    bytes32 private jobId;
-    uint256 private fee;
 
     // Staking token (ERC20)
     IERC20 private stakingToken;
 
     // NFT details structure
     struct AdNFT {
-        string adContentUri;
         uint256 engagementScore;
         uint256 totalStake;
     }
@@ -36,26 +32,15 @@ contract AdCraftPlatform is ERC721, AccessControlEnumerable, ChainlinkClient {
     mapping(uint256 => mapping(address => uint256)) public stakes;
 
     // Events
+    event AdNFTCreated(uint256 indexed tokenId, string metadataUri);
     event AdEngagementUpdated(uint256 indexed tokenId, uint256 engagementScore);
     event StakeUpdated(uint256 indexed tokenId, address indexed staker, uint256 amount);
     event RewardClaimed(uint256 indexed tokenId, address indexed staker, uint256 reward);
-    event OracleSettingsUpdated(address oracle, bytes32 jobId, uint256 fee);
 
     constructor(
-        address _linkToken, 
-        address _oracle, 
-        string memory _jobId, 
-        uint256 _fee, 
         address _stakingToken,
         uint256 _rewardRate
     ) ERC721("AdCraftNFT", "ACNFT") {
-        // Setup Chainlink
-        setChainlinkToken(_linkToken);
-        oracle = _oracle;
-        jobId = bytes32(abi.encodePacked(_jobId));
-        fee = _fee;
-
-        // Initialize the staking token and reward rate
         stakingToken = IERC20(_stakingToken);
         rewardRate = _rewardRate;
 
@@ -64,33 +49,18 @@ contract AdCraftPlatform is ERC721, AccessControlEnumerable, ChainlinkClient {
         _setupRole(ADMIN_ROLE, _msgSender());
     }
 
-    // Modifier to check the admin role
-    modifier onlyAdmin() {
-        require(hasRole(ADMIN_ROLE, _msgSender()), "Caller is not an admin");
-        _;
+    function createAdNFT(string calldata metadataUri) external onlyRole(ADMIN_ROLE) whenNotPaused returns (uint256) {
+        uint256 newTokenId = _getNextTokenId();
+        _mint(_msgSender(), newTokenId);
+        _setTokenURI(newTokenId, metadataUri);
+        adNfts[newTokenId] = AdNFT(0, 0);
+
+        emit AdNFTCreated(newTokenId, metadataUri);
+
+        return newTokenId;
     }
 
-    // Function to change the oracle settings
-    function setOracleSettings(address _oracle, string calldata _jobId, uint256 _fee) external onlyOwner {
-        oracle = _oracle;
-        jobId = bytes32(abi.encodePacked(_jobId));
-        fee = _fee;
-        emit OracleSettingsUpdated(_oracle, jobId, _fee);
-    }
-
-    // Function to set a new reward rate
-    function setRewardRate(uint256 _newRewardRate) external onlyOwner {
-        rewardRate = _newRewardRate;
-    }
-
-    // Function to create Ad-NFT with metadata URI
-    function createAdNFT(uint256 tokenId, string calldata adContentUri) external onlyAdmin {
-        _mint(_msgSender(), tokenId);
-        adNfts[tokenId] = AdNFT(adContentUri, 0, 0);
-    }
-
-    // Function to stake tokens on an Ad-NFT
-    function stakeOnAd(uint256 tokenId, uint256 amount) external {
+    function stakeOnAd(uint256 tokenId, uint256 amount) public whenNotPaused {
         require(_exists(tokenId), "NFT does not exist");
         stakes[tokenId][_msgSender()] += amount;
         adNfts[tokenId].totalStake += amount;
@@ -98,60 +68,107 @@ contract AdCraftPlatform is ERC721, AccessControlEnumerable, ChainlinkClient {
         emit StakeUpdated(tokenId, _msgSender(), amount);
     }
 
-    // Function to request engagement data for an Ad-NFT
-    mapping(bytes32 => uint256) private requestToTokenId;
-
-    function requestEngagementData(uint256 tokenId) external onlyAdmin returns (bytes32 requestId) {
-    Chainlink.Request memory request = buildChainlinkRequest(jobId, address(this), this.fulfillEngagementData.selector);
-    // Set additional parameters for the request
-
-    // ... other request parameters setup ...
-
-    // Send Chainlink Request
-    bytes32 requestId = sendChainlinkRequestTo(oracle, request, fee);
-    
-    // Store request ID to tokenId mapping
-    requestToTokenId[requestId] = tokenId;
-    
-    return requestId;
-    }
-
-    // Callback function for Chainlink oracle's response
-    function fulfillEngagementData(bytes32 _requestId, uint256 _engagementScore) external recordChainlinkFulfillment(_requestId) {
-    // Retrieve the tokenId from the request ID
-    uint256 tokenId = requestToTokenId[_requestId];
-    require(tokenId != 0, "Request ID is not valid");
-
-    // Update the engagement score associated with the NFT tokenId
-    adNfts[tokenId].engagementScore = _engagementScore;
-
-    // Emit an event
-    emit AdEngagementUpdated(tokenId, _engagementScore);
-
-    // Clean up the request mapping if it's a single use
-    delete requestToTokenId[_requestId];
-    }
-
-    // Function for users to withdraw their stake and claim rewards
-    function claimRewards(uint256 tokenId) external {
+    function claimRewards(uint256 tokenId) public whenNotPaused {
         uint256 stakedAmount = stakes[tokenId][_msgSender()];
         require(stakedAmount > 0, "Nothing to claim");
-        
+
         uint256 reward = calculateReward(tokenId, _msgSender());
         stakes[tokenId][_msgSender()] = 0;
         adNfts[tokenId].totalStake -= stakedAmount;
-        
         require(stakingToken.transfer(_msgSender(), stakedAmount + reward), "Reward transfer failed");
         emit RewardClaimed(tokenId, _msgSender(), reward);
     }
 
-    // Function to calculate the reward for a stakeholder based on engagement data
-    function calculateReward(uint256 tokenId, address staker) public view returns (uint256 reward) {
+    function calculateReward(uint256 tokenId, address staker) public view returns (uint256) {
         AdNFT memory adNft = adNfts[tokenId];
         uint256 stakerShare = stakes[tokenId][staker];
-
-        // Reward calculation logic based on engagement data
-        reward = adNft.engagementScore * stakerShare / adNft.totalStake * rewardRate;
+        uint256 reward = adNft.engagementScore * stakerShare / adNft.totalStake * rewardRate;
         return reward;
     }
+
+    function setRewardRate(uint256 _newRewardRate) external onlyRole(ADMIN_ROLE) {
+        rewardRate = _newRewardRate;
+    }
+
+    function updateEngagementScore(uint256 tokenId, uint256 newScore) external onlyRole(ADMIN_ROLE) whenNotPaused {
+        require(_exists(tokenId), "NFT does not exist");
+        adNfts[tokenId].engagementScore = newScore;
+        emit AdEngagementUpdated(tokenId, newScore);
+    }
+
+    function _getNextTokenId() private view returns (uint256) {
+        return totalSupply() + 1;
+    }
+
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
+
+    // Chainlink Oracle parameters
+    address private oracle;
+    bytes32 private jobId;
+    uint256 private fee;
+    
+    // Mapping the request ID returned from Chainlink to the tokenId
+    mapping(bytes32 => uint256) private requestToTokenId;
+
+    // Events
+    event OracleRequestMade(uint256 indexed tokenId, bytes32 requestId);
+    event OracleSettingsUpdated(address oracle, bytes32 jobId, uint256 fee);
+    
+    // Function to set the oracle settings - only callable by the admin
+    function setOracleSettings(
+        address _oracle,
+        string calldata _jobId,
+        uint256 _fee
+    ) external onlyRole(ADMIN_ROLE) {
+        oracle = _oracle;
+        jobId = stringToBytes32(_jobId);
+        fee = _fee;
+        emit OracleSettingsUpdated(_oracle, jobId, _fee);
+    }
+
+    // Function to convert a string to a bytes32
+    function stringToBytes32(string memory source) internal pure returns (bytes32 result) {
+        bytes memory tempEmptyStringTest = bytes(source);
+        if (tempEmptyStringTest.length == 0) {
+            return 0x0;
+        }
+
+        assembly { // solhint-disable-line no-inline-assembly
+            result := mload(add(source, 32))
+        }
+    }
+
+    // Function to request the engagement data for an NFT
+    function requestEngagementData(uint256 tokenId) external onlyRole(ADMIN_ROLE) {
+        Chainlink.Request memory request = buildChainlinkRequest(jobId, address(this), this.fulfillEngagementData.selector);
+
+        // Add a parameter to the request that specifies which NFT we're interested in.
+        request.add("get", string(abi.encodePacked(apiBaseURL, tokenId))); // `apiBaseURL` should be defined elsewhere in your contract
+
+        // Send the request
+        bytes32 requestId = sendChainlinkRequestTo(oracle, request, fee);
+        requestToTokenId[requestId] = tokenId;
+
+        emit OracleRequestMade(tokenId, requestId);
+    }
+
+    // Callback function for Chainlink Oracle to call with the engagement score
+    function fulfillEngagementData(bytes32 _requestId, uint256 _engagementScore) external recordChainlinkFulfillment(_requestId) {
+        uint256 tokenId = requestToTokenId[_requestId];
+        require(_exists(tokenId), "NFT does not exist");
+
+        updateEngagementScore(tokenId, _engagementScore);
+
+        // Optionally remove the mapping if it is a one-off request
+        delete requestToTokenId[_requestId];
+    }
+
+    // Other existing functions...
+
 }

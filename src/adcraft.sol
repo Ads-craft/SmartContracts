@@ -2,6 +2,16 @@
 pragma solidity ^0.8.19;
 
 // Import contracts and libraries
+ 
+ /**
+  * @title adCraft Contract
+  * @notice This smart contract for AdCraft
+  */
+
+/**
+ * @bro tip replace @ccip/contracts/ccip -> with -> smartcontractkit/ccip/tree/ccip-develop/contracts/src/v0.8
+ * When using Remix IDE
+ */
 import "@ccip/contracts/ccip/interfaces/IRouterClient.sol";
 import "@ccip/contracts/shared/access/OwnerIsCreator.sol";
 import "@ccip/contracts/ccip/libraries/Client.sol";

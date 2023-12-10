@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.23;
+pragma solidity ^0.8.19;
 
 // Import contracts and libraries
 import "@ccip/contracts/ccip/interfaces/IRouterClient.sol";
@@ -11,12 +11,12 @@ import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/access/AccessControlEnumerable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 
-contract NFTCrossChainTransfer is ERC721URIStorage, AccessControlEnumerable, Pausable, CCIPReceiver, OwnerIsCreator {
-    using SafeMath for uint256; // Use SafeMath for safer arithmetic operations
+contract adCraft is ERC721URIStorage, AccessControlEnumerable, Pausable, CCIPReceiver, OwnerIsCreator {
+    using SafeMath for uint256; // SafeMath for safer arithmetic operations
 
     bytes32 private constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
-    string public apiBaseURL = "https://adcraft.com/api/data/";  // EXAMPLE
+    string public apiBaseURL = "https://adcraft.com/api/data/"; // EXAMPLE
 
     IERC20 private stakingToken;
 
@@ -32,10 +32,14 @@ contract NFTCrossChainTransfer is ERC721URIStorage, AccessControlEnumerable, Pau
 
     mapping(uint256 => AdNFT) public adNfts; // Mapping from tokenId to AdNFT details
     mapping(uint256 => mapping(address => uint256)) public stakes; // Mapping from tokenId to staker to staked amount
+    mapping(uint256 => bool) public isBurned; // Mapping to track burned NFTs
+    mapping(uint256 => bool) public isNFTBound; // Mapping to keep track of bound NFTs
+    mapping(uint64 => bool) public supportedChains; // Mapping to keep track of compatible chains based on their selectors
 
     // Events
     event AdNFTCreated(uint256 indexed tokenId, string metadataUri);
     event AdEngagementUpdated(uint256 indexed tokenId, uint256 engagementScore);
+     event ChainCompatibilityUpdated(uint64 indexed chainSelector, bool isCompatible);
     event StakeUpdated(uint256 indexed tokenId, address indexed staker, uint256 amount);
     event RewardClaimed(uint256 indexed tokenId, address indexed staker, uint256 reward);
     event MessageSent(
@@ -56,6 +60,13 @@ contract NFTCrossChainTransfer is ERC721URIStorage, AccessControlEnumerable, Pau
         address token,
         uint256 tokenAmount
     );
+    event NFTMoved(
+        uint256 indexed tokenId, 
+        uint64 indexed destinationChainSelector
+    );
+    event NFTBound(
+        uint256 indexed tokenId
+    );
 
     constructor(
         address _stakingToken,
@@ -64,13 +75,18 @@ contract NFTCrossChainTransfer is ERC721URIStorage, AccessControlEnumerable, Pau
         stakingToken = IERC20(_stakingToken);
         rewardRate = _rewardRate;
 
-        _setupRoles(); // Initialize roles during contract deployment
+        _setupRoles(); 
     }
 
     // Function to set up roles
     function _setupRoles() internal {
         _setupRole(DEFAULT_ADMIN_ROLE, _msgSender());
         _setupRole(ADMIN_ROLE, _msgSender());
+    }
+
+    modifier onlyCompatibleChain(uint64 chainSelector) {
+        require(supportedChains[chainSelector], "Chain not compatible");
+        _;
     }
 
     // Function to set the oracle settings - only callable by the admin
@@ -97,6 +113,22 @@ contract NFTCrossChainTransfer is ERC721URIStorage, AccessControlEnumerable, Pau
         return newTokenId;
     }
 
+    // Function to bind an NFT with staking properties for ad creators
+    function bindAdNFT(uint256 tokenId) external onlyRole(ADMIN_ROLE) whenNotPaused {
+        require(_exists(tokenId), "NFT does not exist");
+        require(!isNFTBound[tokenId], "NFT already bound");
+
+        // Mark the NFT as bound
+        isNFTBound[tokenId] = true;
+
+        emit NFTBound(tokenId);
+    }
+
+    // Function to check if an NFT is bound for staking
+    function getBindingStatus(uint256 tokenId) external view returns (bool) {
+        return isNFTBound[tokenId];
+    }
+
     // Function to stake on a specific AdNFT
     function stakeOnAd(uint256 tokenId, uint256 amount) public whenNotPaused {
         require(_exists(tokenId), "NFT does not exist");
@@ -105,6 +137,22 @@ contract NFTCrossChainTransfer is ERC721URIStorage, AccessControlEnumerable, Pau
         require(stakingToken.transferFrom(_msgSender(), address(this), amount), "Stake transfer failed");
         emit StakeUpdated(tokenId, _msgSender(), amount);
     }
+
+    // Function to transfer tokens between addresses
+    function transfer(address to, uint256 amount) external whenNotPaused {
+        require(stakingToken.transfer(to, amount), "Transfer failed");
+    }
+
+    // Function to retrieve token balance of a specific address
+    function balanceOf(address account) external view returns (uint256) {
+        return stakingToken.balanceOf(account);
+    }
+
+    // Function to allow another address to spend tokens on behalf of the owner
+    function approve(address spender, uint256 amount) external whenNotPaused returns (bool) {
+        return stakingToken.approve(spender, amount);
+    }
+
 
     // Function to claim rewards for a specific AdNFT
     function claimRewards(uint256 tokenId) public whenNotPaused {
@@ -176,8 +224,45 @@ contract NFTCrossChainTransfer is ERC721URIStorage, AccessControlEnumerable, Pau
         delete requestToTokenId[_requestId];
     }
 
-    // Function to send data and transfer tokens to receiver on the destination chain - only callable by admins
-    function sendMessagePayLINK(
+    // Function to check if a chain is compatible for NFT movement
+    function checkChainCompatibility(uint64 chainSelector) external view returns (bool) {
+        return supportedChains[chainSelector];
+    }
+
+    // Owner-only function to add or remove compatible chains
+    function updateChainCompatibility(uint64 chainSelector, bool isCompatible) external onlyOwner {
+        supportedChains[chainSelector] = isCompatible;
+        emit ChainCompatibilityUpdated(chainSelector, isCompatible);
+    }
+
+    // Function to move an ad-related NFT to another compatible blockchain
+    function moveToChain(uint256 tokenId, uint64 destinationChainSelector) external onlyRole(ADMIN_ROLE) whenNotPaused onlyCompatibleChain(destinationChainSelector) {
+        require(_exists(tokenId), "NFT does not exist");
+        require(!isBurned[tokenId], "NFT already burned");
+
+        // Burn the NFT on the current chain
+        _burn(tokenId);
+
+        // Mark the NFT as burned
+        isBurned[tokenId] = true;
+
+        // Get metadata URI of the NFT
+        string memory metadataUri = tokenURI(tokenId);
+
+        // Initiate the transfer of relevant information to the destination chain
+        bytes32 messageId = sendMessagePayNative(
+            destinationChainSelector,
+            address(this), // Assuming the NFT is transferred to this contract on the destination chain
+            metadataUri,
+            address(this), // Token address on the destination chain
+            tokenId // Token ID can be used as a unique identifier on the destination chain
+        );
+        // Emit an event indicating that the NFT is being moved to another chain
+        emit NFTMoved(tokenId, destinationChainSelector);
+    }
+
+    // Function to send a CCIP message and pay the fees in stakingToken
+    function sendMessagePayNative(
         uint64 _destinationChainSelector,
         address _receiver,
         string calldata _text,
@@ -250,6 +335,91 @@ contract NFTCrossChainTransfer is ERC721URIStorage, AccessControlEnumerable, Pau
                     Client.EVMExtraArgsV1({ gasLimit: 200_000, strict: false })
                 ),
                 feeToken: _feeTokenAddress
-            });
+            }
+        );
+    }
+
+    // Function to buy AI NFTs in the marketplace on different chains
+    function buyAINFT(
+        uint64 _destinationChainSelector,
+        address _receiver,
+        string calldata _nftMetadataUri,
+        address _nftTokenAddress,
+        uint256 _nftTokenId,
+        address _paymentToken,
+        uint256 _paymentAmount
+    )
+        external
+        onlyRole(ADMIN_ROLE)
+        onlyAllowlistedDestinationChain(_destinationChainSelector)
+    {
+        // Build the CCIP message
+        Client.EVM2AnyMessage memory evm2AnyMessage = _buildCCIPMessage(
+            _receiver,
+            _nftMetadataUri,
+            _nftTokenAddress,
+            _nftTokenId,
+            _paymentToken
+        );
+
+        // Get the router interface
+        IRouterClient router = IRouterClient(getRouter());
+
+        // Get fees for the message
+        uint256 fees = router.getFee(_destinationChainSelector, evm2AnyMessage);
+
+        // Check if the contract has enough balance to cover the fees
+        require(fees <= stakingToken.balanceOf(address(this)), "Not enough balance for fees");
+
+        // Approve the Router to transfer stakingToken on contract's behalf
+        require(stakingToken.approve(address(router), fees), "Failed to approve stakingToken transfer");
+
+        // Send the message through the router
+        bytes32 messageId = router.ccipSend(_destinationChainSelector, evm2AnyMessage);
+
+        // Emit the MessageSent event
+        emit MessageSent(
+            messageId,
+            _destinationChainSelector,
+            _receiver,
+            _nftMetadataUri,
+            _nftTokenAddress,
+            _nftTokenId,
+            _paymentToken,
+            _paymentAmount
+        );
+    }
+
+    // Function to construct a CCIP message for buying NFTs
+    function _buildCCIPMessage(
+        address _receiver,
+        string calldata _nftMetadataUri,
+        address _nftTokenAddress,
+        uint256 _nftTokenId,
+        address _paymentToken
+    ) internal pure returns (Client.EVM2AnyMessage memory) {
+        // Create an array for token amounts
+        Client.EVMTokenAmount[] memory tokenAmounts = new Client.EVMTokenAmount[](2);
+        tokenAmounts[0] = Client.EVMTokenAmount({
+            token: _nftTokenAddress,
+            amount: _nftTokenId
+        });
+        tokenAmounts[1] = Client.EVMTokenAmount({
+            token: _paymentToken,
+            amount: 0 // Amount will be set by the router on the destination chain
+        });
+
+        // Construct the CCIP message
+        return
+            Client.EVM2AnyMessage({
+                receiver: abi.encode(_receiver),
+                data: abi.encode(_nftMetadataUri),
+                tokenAmounts: tokenAmounts,
+                extraArgs: Client._argsToBytes(
+                    Client.EVMExtraArgsV1({ gasLimit: 200_000, strict: false })
+                ),
+                feeToken: address(0) // Fees are paid in native gas
+            }
+        );
     }
 }
